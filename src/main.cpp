@@ -25,6 +25,7 @@ typedef cv::Mat MMat;
 #endif
 
 H5File h5flow, h5contour;
+bool running;
 
 po::variables_map parse(int argc, char **argv) {
 	po::options_description op("Command line options");
@@ -45,12 +46,12 @@ po::variables_map parse(int argc, char **argv) {
 	("data,d", po::value<std::string>()->implicit_value(""), "path of the output hdf5 data file")
 	("movie,m", po::value<std::string>()->implicit_value(""), "path of the output video")
 	("live,l", po::bool_switch(), "display live window?")
-	("frame.start", po::value<int>()->default_value(1), "first frame of interest")
-	("frame.stop", po::value<int>(), "last frame of interest")
-	("frame.step", po::value<int>()->default_value(1), "step between frames of interest")
-	("frame.count", po::value<int>(), "number of frames of interest")
-	("grid.width", po::value<int>()->default_value(128), "number of horizontal grid points")
-	("grid.height", po::value<int>()->default_value(64), "number of vertical grid points");
+	("frame.start", po::value<size_t>()->default_value(1), "first frame of interest")
+	("frame.stop", po::value<size_t>(), "last frame of interest")
+	("frame.step", po::value<size_t>()->default_value(1), "step between frames of interest")
+	("frame.count", po::value<size_t>(), "number of frames of interest")
+	("grid.width", po::value<size_t>()->default_value(128), "number of horizontal grid points")
+	("grid.height", po::value<size_t>()->default_value(64), "number of vertical grid points");
 	op.add(fop);
 
 	// Parse command line
@@ -93,8 +94,8 @@ po::variables_map parse(int argc, char **argv) {
 }
 
 void frameLogic(const po::variables_map& config, size_t& start, size_t& stop, size_t& step, size_t& count, size_t max_count) {
-	start = config["frame.start"].as<int>();
-	step = config["frame.step"].as<int>();
+	start = config["frame.start"].as<size_t>();
+	step = config["frame.step"].as<size_t>();
 	stop = max_count;
 	count = max_count;
 
@@ -142,9 +143,7 @@ void frameLogic(const po::variables_map& config, size_t& start, size_t& stop, si
 void siginthandler(int param)
 {
 	std::cerr << std::endl;
-	h5flow.flush();
-	h5contour.flush();
-	std::exit(-1);
+	running = false;
 }
 
 
@@ -306,7 +305,8 @@ int main(int argc, char* argv[]) {
 	int flags = cv::OPTFLOW_FARNEBACK_GAUSSIAN;
 	std::cout << "    0% (1/" << count << ")" << std::flush;
 	std::chrono::time_point<std::chrono::system_clock> time_start, time_end;
-	for (size_t i = start, j = 0; i <= stop && cap.read(im); i += step, ++j) {
+	running = true;
+	for (size_t i = start, j = 0; running && i <= stop && cap.read(im); i += step, ++j) {
 		time_start = std::chrono::system_clock::now();
 		cv::cvtColor(im, gm, CV_RGB2GRAY); // convert to grayscale
 		if(invert) {
@@ -318,12 +318,11 @@ int main(int argc, char* argv[]) {
 		cv::subtract(255, gm, gm);
 		prev = next;
 		next = gm.clone();
-		cv::threshold(gm, gm, 200, 255, cv::THRESH_BINARY);
-		cv::GaussianBlur(gm, gm, cv::Size(95, 95), 0, 0);
+		cv::GaussianBlur(gm, gm, cv::Size(5, 5), 0, 0);
 		cv::addWeighted(gm, -4, gm, 0, 1024, gm);
 
 		// Compute density mask
-		cv::threshold(gm, mask, 40, 255, cv::THRESH_BINARY);
+		cv::threshold(gm, mask, 180, 255, cv::THRESH_BINARY);
 
 		// Compute optical flow
 		if (i == start) continue; // requires two frames
