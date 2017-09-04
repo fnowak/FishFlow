@@ -12,10 +12,19 @@
 #include <opencv2/opencv.hpp>
 
 #include "plot.hpp"
+#include "h5sx.hpp"
 
 
 namespace po = boost::program_options;
 
+#define USE_CL
+#ifdef USE_CL
+typedef cv::UMat MMat;
+#else
+typedef cv::Mat MMat;
+#endif
+
+H5File h5flow, h5contour;
 
 po::variables_map parse(int argc, char **argv) {
 	po::options_description op("Command line options");
@@ -32,6 +41,7 @@ po::variables_map parse(int argc, char **argv) {
 	fop.add_options()
 	("input,i", po::value<std::string>()->required(), "path of the input file")
 	("background,b", po::value<std::string>(), "path of the input background image")
+	("invert", po::bool_switch(), "invert background")
 	("data,d", po::value<std::string>()->implicit_value(""), "path of the output hdf5 data file")
 	("movie,m", po::value<std::string>()->implicit_value(""), "path of the output video")
 	("live,l", po::bool_switch(), "display live window?")
@@ -82,7 +92,7 @@ po::variables_map parse(int argc, char **argv) {
 	return vm;
 }
 
-void frameLogic(const po::variables_map& config, int& start, int& stop, int& step, int& count, int max_count) {
+void frameLogic(const po::variables_map& config, size_t& start, size_t& stop, size_t& step, size_t& count, size_t max_count) {
 	start = config["frame.start"].as<int>();
 	step = config["frame.step"].as<int>();
 	stop = max_count;
@@ -129,14 +139,11 @@ void frameLogic(const po::variables_map& config, int& start, int& stop, int& ste
 	}
 }
 
-H5::H5File file;
-
 void siginthandler(int param)
 {
 	std::cerr << std::endl;
-	if (file.getId() > 0) {
-		file.flush(H5F_SCOPE_GLOBAL);
-	}
+	h5flow.flush();
+	h5contour.flush();
 	std::exit(-1);
 }
 
@@ -163,6 +170,10 @@ const char* dots[] = {
 
 int main(int argc, char* argv[]) {
 	signal(SIGINT, siginthandler);
+
+	H5File h5flow, h5contour;
+	size_t total_points_contour = 0;
+	H5::CompType xy_dtype;
 
 	// Read config
 	po::variables_map config;
@@ -192,20 +203,26 @@ int main(int argc, char* argv[]) {
 		std::exit(0);
 	}
 
-	int start, stop, step, count;
+	size_t start, stop, step, count;
 	frameLogic(config, start, stop, step, count, c);
 
 	// Compute background image
 	std::string bgpath;
-	cv::Mat im, gm, bg;
+	cv::Mat im;
+	MMat gm, bg;
 	if (config.count("background")) {
 		bgpath = config["background"].as<std::string>();
-		bg = cv::imread(bgpath, CV_LOAD_IMAGE_GRAYSCALE);
+		cv::Mat tmp = cv::imread(bgpath, CV_LOAD_IMAGE_GRAYSCALE);
+#ifdef USE_CL
+		bg = tmp.getUMat(cv::ACCESS_READ);
+#else
+		bg = tmp;
+#endif
 	} else {
 		bgpath = config["input"].as<std::string>() + ".background.jpg";
 	}
 	if (bg.empty()) {
-		bg = cv::Mat(h, w, CV_32FC1, cv::Scalar::all(0));
+		bg = MMat(h, w, CV_32FC1, cv::Scalar::all(0));
 		std::cout << "Computing background image:" << std::endl;
 		std::cout << "    0% (1/" << c << ")" << std::flush;
 		for (int i = 0; cap.read(im); ++i) {
@@ -213,10 +230,15 @@ int main(int argc, char* argv[]) {
 			cv::accumulate(gm, bg);
 			std::cout << '\r' << dots[i%256] << ' ' << std::setw(3) << (i + 1) * 100 / c << "% (" << i+1 << "/" << c << ")" << std::flush;
 		}
-		bg /= c;
+		cv::divide(bg, c, bg);
 		bg.convertTo(bg, CV_8U);
 		cv::imwrite(bgpath, bg);
 		std::cout << std::endl;
+	}
+
+	const bool invert = config["invert"].as<bool>();
+	if (invert) {
+	    cv::subtract(255, bg, bg);
 	}
 
 	// Rewind
@@ -242,37 +264,38 @@ int main(int argc, char* argv[]) {
 			return -1;
 		}
 	}
-	const int gw = config["grid.width"].as<int>();
-	const int gh = config["grid.height"].as<int>();
+	const size_t gw = config["grid.width"].as<size_t>();
+	const size_t gh = config["grid.height"].as<size_t>();
 	Plot plot(gw, gh);
-	H5::DataSet velocity_dset;
-	H5::DataSet density_dset;
-	H5::CompType xy_dtype(2 * sizeof(float));
-	H5::DataSpace mem_space, file_dspace;
+
 	if (data) {
 		std::string path = config["data"].as<std::string>();
 		if (path.empty()) {
 			path = config["input"].as<std::string>() + ".flow.h5";
 		}
-		file = H5::H5File(path, H5F_ACC_TRUNC);
-		const hsize_t dims[3] = {
-			static_cast<hsize_t>(count),
-			static_cast<hsize_t>(gw),
-			static_cast<hsize_t>(gh)
-		};
-		file_dspace = H5::DataSpace(3, &dims[0]);
-		mem_space = H5::DataSpace(2, &dims[1]);
+
+		xy_dtype = H5::CompType(2 * sizeof(float));
 		xy_dtype.insertMember("x", 0 * sizeof(float), H5::PredType::NATIVE_FLOAT);
 		xy_dtype.insertMember("y", 1 * sizeof(float), H5::PredType::NATIVE_FLOAT);
-		velocity_dset = file.createDataSet("velocity", xy_dtype, file_dspace);
-		density_dset = file.createDataSet("density", H5::PredType::NATIVE_UCHAR, file_dspace);
+
+		const hsize_t dims_flow[3] = {count-1, gw, gh};
+
+		h5flow.init(path, true);
+		h5flow.add_data_set<3>("velocity", xy_dtype, dims_flow);
+		h5flow.add_data_set<3>("density", H5::PredType::NATIVE_UCHAR, dims_flow);
+
+		const hsize_t dims_bp[2] = {3, 10};
+		const hsize_t max_dims[2] = {3, H5S_UNLIMITED};
+		const hsize_t chunk_dims[2] ={3, 10};
+
+		h5flow.add_extendable_data_set<2>("boundaryPaths", H5::PredType::NATIVE_FLOAT, dims_bp, max_dims, chunk_dims);
 	}
 
 	// Compute density and optical flow
 	std::cerr << "Computing density and optical flow:" << std::endl;
 	const cv::Size size(gw, gh);
-	cv::Mat prev, next, mask, uv;
-	cv::Mat sd(gh, gw, CV_8UC1), suv(gh, gw, CV_32FC2);
+	MMat prev, next, mask, uv;
+	MMat sd(gh, gw, CV_8UC1), suv(gh, gw, CV_32FC2);
 	// Gunnar Farneback’s Optical Flow options
 	const double pyr_scale = 0.5;
 	const int levels = 2;
@@ -282,11 +305,17 @@ int main(int argc, char* argv[]) {
 	const double poly_sigma = 1.5;
 	int flags = cv::OPTFLOW_FARNEBACK_GAUSSIAN;
 	std::cout << "    0% (1/" << count << ")" << std::flush;
-	for (int i = start, j = 0; i <= stop && cap.read(im); i += step, ++j) {
+	std::chrono::time_point<std::chrono::system_clock> time_start, time_end;
+	for (size_t i = start, j = 0; i <= stop && cap.read(im); i += step, ++j) {
+		time_start = std::chrono::system_clock::now();
 		cv::cvtColor(im, gm, CV_RGB2GRAY); // convert to grayscale
+		if(invert) {
+		    cv::subtract(255, gm, gm);
+		}
 
 		// Compute density
-		gm = gm - bg + 255;
+		cv::subtract(bg, gm, gm);
+		cv::subtract(255, gm, gm);
 		prev = next;
 		next = gm.clone();
 		cv::threshold(gm, gm, 200, 255, cv::THRESH_BINARY);
@@ -302,8 +331,12 @@ int main(int argc, char* argv[]) {
 		flags |= cv::OPTFLOW_USE_INITIAL_FLOW;
 
 		if (live || vid) {
-			cv::addWeighted(im, 0.5, color(gm), 0.5, 0, im);
-			plot.plotVelocity(im, uv, mask);
+			cv::Mat gm_tmp, uv_tmp, mask_tmp;
+			gm.copyTo(gm_tmp);
+			uv.copyTo(uv_tmp);
+			mask.copyTo(mask_tmp);
+			cv::addWeighted(im, 0.5, color(gm_tmp), 0.5, 0, im);
+			plot.plotVelocity(im, uv_tmp, mask_tmp);
 		}
 
 		if (live) {
@@ -316,24 +349,53 @@ int main(int argc, char* argv[]) {
 		}
 
 		if (data) {
-			const hsize_t start[3] = { static_cast<hsize_t>(j), 0, 0 };
-			const hsize_t count[3] = {
-				1,
-				static_cast<hsize_t>(gw),
-				static_cast<hsize_t>(gh)
-			};
-			file_dspace.selectHyperslab(H5S_SELECT_SET, count, start);
 			cv::resize(uv, suv, size);
 			cv::flip(suv, suv, 0);
 			cv::transpose(suv, suv);
-			velocity_dset.write(suv.ptr(), xy_dtype, mem_space, file_dspace);
+
 			cv::resize(gm, sd, size);
 			cv::flip(sd, sd, 0);
 			cv::transpose(sd, sd);
-			density_dset.write(sd.ptr(), H5::PredType::NATIVE_UCHAR, mem_space, file_dspace);
+
+			const hsize_t start_flow[3] = { j-1, 0, 0 };
+			const hsize_t count_flow[3] = { 1, gw, gh };
+
+#ifdef USE_CL
+			h5flow.write<3>("velocity", suv.getMat(cv::ACCESS_READ).ptr(), start_flow, count_flow);
+			h5flow.write<3>("density", sd.getMat(cv::ACCESS_READ).ptr(), start_flow, count_flow);
+#else
+			h5flow.write<3>("velocity", suv.ptr(), start, count);
+			h5flow.write<3>("density", sd.ptr(), start, count);
+#endif
+
+			std::vector<std::vector<cv::Point> > contours;
+			cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+			std::vector<cv::Point> largest_contour;
+			for(size_t i = 0; i < contours.size(); i++) {
+				std::vector<cv::Point> c = contours.at(i);
+				if(c.size() > largest_contour.size())
+					largest_contour = c;
+			}
+
+			size_t dataChunkStart = total_points_contour;
+			const size_t n = largest_contour.size();
+			total_points_contour += n;
+
+			const hsize_t start_bp[2] = {0, dataChunkStart};
+			const hsize_t count_bp[2] = {3, n};
+			float data[3][n];
+			for(int i = 0; i < n; i++) {
+				data[0][i] = largest_contour.at(i).x;
+				data[1][i] = largest_contour.at(i).y;
+				data[2][i] = j;
+			}
+			h5contour.write<2>("boundaryPaths", &data, start_bp, count_bp);
 		}
 
-		std::cout << '\r' << dots[j%256] << ' ' << std::setw(3) << (j + 1) * 100 / count << "% (" << j+1 << "/" << count << ")" << std::flush;
+		time_end = std::chrono::system_clock::now();
+		std::chrono::duration<double> elapsed_seconds = time_end-time_start;
+		std::cout << '\r' << dots[j%256] << ' ' << std::setw(3) << (j + 1) * 100 / count << "% (" << j+1 << "/" << count << ")"
+			  << " elapsed time: " << elapsed_seconds.count() << " fps: " << (1.f / elapsed_seconds.count()) << std::flush;
 
 		// Skip frames instead of setting CV_CAP_PROP_POS_FRAMES to avoid issue with keyframes
 		for (int k = 1; k < step; ++k) cap.grab();
